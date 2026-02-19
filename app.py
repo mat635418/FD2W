@@ -52,8 +52,8 @@ enable_map = st.sidebar.checkbox("Enable Geographical Map", value=True, help="Di
 max_locations = 40
 if enable_map:
     max_locations = st.sidebar.slider("Locations to Geocode", min_value=5, max_value=100, value=40, step=5)
-    est_time = int(max_locations * 1.2)
-    st.sidebar.info(f"⏱️ Estimated map loading time: ~{est_time} seconds")
+    est_time = int(max_locations * 0.8)
+    st.sidebar.info(f"⏱️ Estimated map loading time: ~{est_time} seconds (unique cities only)")
 
 
 # --- 2. DATA PROCESSING ---
@@ -108,7 +108,7 @@ def load_and_process_data(file_source):
 def load_locations_and_geocode(file_source, limit):
     df_loc = pd.read_excel(file_source, sheet_name='Sheet1')
     
-    # THE FIX: Safely find the actual "location" column regardless of leading empty columns
+    # Safely find the actual "location" column regardless of leading empty columns
     loc_col = [c for c in df_loc.columns if 'location' in str(c).lower()]
     if loc_col:
         df_loc.rename(columns={loc_col[0]: 'Location'}, inplace=True)
@@ -116,36 +116,44 @@ def load_locations_and_geocode(file_source, limit):
     df_loc['Location'] = df_loc['Location'].astype(str).str.strip()
     df_loc = df_loc.head(limit).copy()
     
+    # Extract city and country for geocoding (more reliable than full street addresses)
+    df_loc['city_key'] = df_loc['City'].fillna('').astype(str).str.strip()
+    df_loc['country_key'] = df_loc['iso Country'].fillna('').astype(str).str.strip()
+
+    # Geocode only unique city/country combinations to reduce API calls
+    unique_pairs = df_loc[['city_key', 'country_key']].drop_duplicates()
+    total = len(unique_pairs)
+
     # Nominatim requires a valid user agent to not block requests
     headers = {'User-Agent': 'EMEA_Distribution_App_V4'}
-    latitudes, longitudes = [], []
-    
-    for _, row in df_loc.iterrows():
-        street = str(row.get('street address', '')) if pd.notna(row.get('street address')) else ''
-        city = str(row.get('City', '')) if pd.notna(row.get('City')) else ''
-        country = str(row.get('iso Country', '')) if pd.notna(row.get('iso Country')) else ''
-        
-        query = f"{street} {city} {country}".strip()
+    coord_cache = {}
+
+    for i, (_, pair) in enumerate(unique_pairs.iterrows()):
+        city, country = pair['city_key'], pair['country_key']
+        query = f"{city}, {country}".strip(', ')
+        print(f"Geocoding ({i + 1}/{total}): {query}...")
         try:
-            r = requests.get(f"https://nominatim.openstreetmap.org/search?q={query}&format=json&limit=1", headers=headers, timeout=5).json()
+            r = requests.get(
+                f"https://nominatim.openstreetmap.org/search?q={query}&format=json&limit=1",
+                headers=headers,
+                timeout=10,
+            ).json()
             if r:
-                latitudes.append(float(r[0]['lat']))
-                longitudes.append(float(r[0]['lon']))
+                coord_cache[(city, country)] = (float(r[0]['lat']), float(r[0]['lon']))
+                print(f"  ✓ {query}")
             else:
-                query_fb = f"{city} {country}".strip()
-                r_fb = requests.get(f"https://nominatim.openstreetmap.org/search?q={query_fb}&format=json&limit=1", headers=headers, timeout=5).json()
-                if r_fb:
-                    latitudes.append(float(r_fb[0]['lat']))
-                    longitudes.append(float(r_fb[0]['lon']))
-                else:
-                    latitudes.append(None); longitudes.append(None)
-        except Exception:
-            latitudes.append(None); longitudes.append(None)
-            
+                print(f"  ✗ No results for: {query}")
+                coord_cache[(city, country)] = (None, None)
+        except Exception as e:
+            print(f"  ✗ Error for {query}: {e}")
+            coord_cache[(city, country)] = (None, None)
+
         time.sleep(1.1)
-        
-    df_loc['lat'] = latitudes
-    df_loc['lon'] = longitudes
+
+    pair_keys = list(zip(df_loc['city_key'], df_loc['country_key']))
+    df_loc['lat'] = [coord_cache.get(k, (None, None))[0] for k in pair_keys]
+    df_loc['lon'] = [coord_cache.get(k, (None, None))[1] for k in pair_keys]
+    df_loc.drop(columns=['city_key', 'country_key'], inplace=True)
     return df_loc
 
 
