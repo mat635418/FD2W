@@ -4,14 +4,14 @@ import plotly.express as px
 import os
 import traceback
 
-st.set_page_config(page_title="EMEA SC SE Network", layout="wide")
+st.set_page_config(page_title="EMEA FD2W App", layout="wide")
 
 # --- 1. LOGIN MASK ---
 if "logged_in" not in st.session_state:
     st.session_state["logged_in"] = False
 
 if not st.session_state["logged_in"]:
-    st.title("Login to EMEA Distribution Network App")
+    st.title("Login to EMEA FD2W App")
     
     try:
         SECURE_USER = st.secrets.get("credentials", {}).get("username", "admin")
