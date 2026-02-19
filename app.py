@@ -100,11 +100,17 @@ def load_and_process_data(file_source):
 def load_locations(file_source):
     df_loc = pd.read_excel(file_source, sheet_name='Sheet1')
     
-    # Safely find the actual "location" column regardless of leading empty columns
-    loc_col = [c for c in df_loc.columns if 'location' in str(c).lower()]
-    if loc_col:
-        df_loc.rename(columns={loc_col[0]: 'Location'}, inplace=True)
-        
+    # THE FIX: Strictly search for the exact "location" column (ignoring "location full name")
+    exact_loc_col = [c for c in df_loc.columns if str(c).strip().lower() == 'location']
+    
+    if exact_loc_col:
+        df_loc.rename(columns={exact_loc_col[0]: 'Location'}, inplace=True)
+    else:
+        # Fallback just in case
+        loc_col = [c for c in df_loc.columns if 'location' in str(c).lower()]
+        if loc_col:
+            df_loc.rename(columns={loc_col[0]: 'Location'}, inplace=True)
+            
     df_loc['Location'] = df_loc['Location'].astype(str).str.strip()
     
     # Safely find latitude and longitude columns from your file
@@ -206,11 +212,14 @@ try:
         df_map = pd.merge(df_locations, df_map_agg, on='Location', how='inner').dropna(subset=['lat', 'lon'])
 
         if not df_map.empty:
+            # Check if there is a full name available for hover data
+            hover_name_col = 'location full name' if 'location full name' in df_map.columns else 'Location'
+            
             fig_map = px.scatter_mapbox(df_map, lat='lat', lon='lon', color='Wh_Role', size='Volume',
-                                        hover_name='Location', hover_data=['City', 'Volume'],
+                                        hover_name=hover_name_col, hover_data=['City', 'Volume'],
                                         color_discrete_map=color_map, zoom=3, height=700,
                                         mapbox_style='carto-positron',
-                                        size_max=45) # Increased bubble size for visibility
+                                        size_max=45) 
             st.plotly_chart(fig_map, use_container_width=True)
             
             st.success(f"Successfully mapped {len(df_map['Location'].unique())} locations!")
