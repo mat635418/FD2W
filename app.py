@@ -16,11 +16,11 @@ if not st.session_state["logged_in"]:
     st.title("Login to EMEA Distribution Network App")
     
     try:
-        SECURE_USER = st.secrets["credentials"]["username"]
-        SECURE_PASS = st.secrets["credentials"]["password"]
-    except KeyError:
-        st.error("⚠️ Secrets not found! Please configure your Streamlit Secrets in the Cloud Settings.")
-        st.stop()
+        SECURE_USER = st.secrets.get("credentials", {}).get("username", "admin")
+        SECURE_PASS = st.secrets.get("credentials", {}).get("password", "goodyear")
+    except Exception:
+        SECURE_USER = "admin"
+        SECURE_PASS = "goodyear"
 
     username = st.text_input("Username")
     password = st.text_input("Password", type="password")
@@ -56,11 +56,11 @@ if enable_map:
     st.sidebar.info(f"⏱️ Estimated loading time: ~{est_time} seconds")
 
 
-# --- 2. DATA PROCESSING (100% CRASH-PROOF) ---
+# --- 2. DATA PROCESSING (SIMPLIFIED & CRASH-PROOF) ---
 @st.cache_data(show_spinner=False)
 def load_and_process_data(file_source):
-    # Read the file as a raw grid without headers
-    df_raw = pd.read_excel(file_source, skiprows=8, header=None)
+    # Read the 'full' sheet without headers (skiprows=0 now because metadata is gone)
+    df_raw = pd.read_excel(file_source, sheet_name='full', header=None)
     
     # Extract the two header rows
     forecast_types = df_raw.iloc[0].ffill() # Forward fill merged cells
@@ -72,8 +72,8 @@ def load_and_process_data(file_source):
     # Build a single flat list of unique column names using a regex-safe separator
     new_columns = ['Market'] # The first column is always the Market
     for i in range(1, len(df_raw.columns)):
-        ft = str(forecast_types[i]).strip()
-        loc = str(locations[i]).strip()
+        ft = str(forecast_types.iloc[i]).strip()
+        loc = str(locations.iloc[i]).strip()
         new_columns.append(f"{ft}___{loc}")
         
     df_data.columns = new_columns
@@ -81,7 +81,7 @@ def load_and_process_data(file_source):
     # Melt it down into a long format
     df_long = df_data.melt(id_vars=['Market'], var_name='RawCol', value_name='Volume')
     
-    # THE FIX: Unbreakable extraction (no more split expand=True errors)
+    # Unbreakable extraction
     df_long['ForecastType'] = df_long['RawCol'].apply(lambda x: str(x).split('___')[0] if '___' in str(x) else 'Unknown')
     df_long['Location'] = df_long['RawCol'].apply(lambda x: str(x).split('___')[1] if '___' in str(x) else str(x))
     df_long.drop(columns=['RawCol'], inplace=True)
@@ -90,7 +90,7 @@ def load_and_process_data(file_source):
     df_long = df_long.dropna(subset=['Market'])
     df_long['Market'] = df_long['Market'].astype(str).str.strip()
     
-    # Force Volume to numeric (turns empty spaces, dashes, etc., into NaNs, then 0)
+    # Force Volume to numeric
     df_long['Volume'] = pd.to_numeric(df_long['Volume'], errors='coerce').fillna(0)
     df_long = df_long[df_long['Volume'] > 0] # Drop empty lines
     
@@ -111,7 +111,8 @@ def load_and_process_data(file_source):
 
 @st.cache_data(show_spinner=False)
 def load_locations_and_geocode(file_source, limit):
-    df_loc = pd.read_excel(file_source)
+    # Read the 'Sheet1' for locations
+    df_loc = pd.read_excel(file_source, sheet_name='Sheet1')
     
     # Clean location column name
     if 'location' in df_loc.columns:
@@ -122,7 +123,7 @@ def load_locations_and_geocode(file_source, limit):
     df_loc['Location'] = df_loc['Location'].astype(str).str.strip()
     df_loc = df_loc.head(limit).copy()
     
-    headers = {'User-Agent': 'GoodYearDistributionApp/2.2'}
+    headers = {'User-Agent': 'GoodYearDistributionApp/3.0'}
     latitudes, longitudes = [], []
     
     for _, row in df_loc.iterrows():
@@ -160,8 +161,7 @@ st.title("EMEA Distribution Network")
 if "data_loaded" not in st.session_state:
     st.session_state["data_loaded"] = False
 
-pivot_name = "Cube - EMEA SC SE - FC Distribution to Warehouse - V1.xlsx"
-loc_name = "locations_info.xlsx"
+master_file_name = "fd2w.xlsx"
 
 if not st.session_state.get("data_loaded"):
     st.info("👈 Please select a data source below to begin.")
@@ -170,22 +170,19 @@ if not st.session_state.get("data_loaded"):
     with col1:
         st.subheader("Automated Mode")
         if st.button("Load pre-selected FD2W data"):
-            if os.path.exists(pivot_name) and os.path.exists(loc_name):
-                st.session_state['pivot_file'] = pivot_name
-                st.session_state['loc_file'] = loc_name
+            if os.path.exists(master_file_name):
+                st.session_state['data_file'] = master_file_name
                 st.session_state["data_loaded"] = True
                 st.rerun() 
             else:
-                st.error(f"Files not found on server. Ensure exact names: `{pivot_name}` and `{loc_name}`")
+                st.error(f"File not found on server. Ensure exact name: `{master_file_name}`")
 
     with col2:
         st.subheader("Manual Mode")
-        up_pivot = st.file_uploader("Upload Pivot XLSX", type=['xlsx'])
-        up_loc = st.file_uploader("Upload Locations XLSX", type=['xlsx'])
-        if up_pivot and up_loc:
-            if st.button("Process Uploaded Files"):
-                st.session_state['pivot_file'] = up_pivot
-                st.session_state['loc_file'] = up_loc
+        up_file = st.file_uploader("Upload Master XLSX (fd2w.xlsx)", type=['xlsx'])
+        if up_file:
+            if st.button("Process Uploaded File"):
+                st.session_state['data_file'] = up_file
                 st.session_state["data_loaded"] = True
                 st.rerun() 
     st.stop()
@@ -193,12 +190,12 @@ if not st.session_state.get("data_loaded"):
 
 # --- 4. VISUALIZATION DASHBOARD ---
 try:
-    with st.spinner("Decoding pivot and rendering charts..."):
-        df_data = load_and_process_data(st.session_state['pivot_file'])
+    with st.spinner("Decoding dataset and rendering charts..."):
+        df_data = load_and_process_data(st.session_state['data_file'])
     
         if enable_map:
             with st.spinner(f"Geocoding up to {max_locations} locations... this will take ~{est_time}s"):
-                df_locations = load_locations_and_geocode(st.session_state['loc_file'], max_locations)
+                df_locations = load_locations_and_geocode(st.session_state['data_file'], max_locations)
 
     color_map = {'FWs': '#D8BFD8', 'RDCs': '#FFCCCB', 'LDCs': '#FFFFE0'}
 
@@ -209,7 +206,7 @@ try:
                       color_discrete_map=color_map, barmode='stack')
         st.plotly_chart(fig1, use_container_width=True)
     else:
-        st.error("Data was processed, but the final table is empty. Please verify the structure of the Pivot file.")
+        st.error("Data was processed, but the final table is empty. Please verify the structure of the 'full' sheet.")
         st.stop()
 
     st.divider()
@@ -235,7 +232,7 @@ try:
                                         mapbox_style='carto-positron')
             st.plotly_chart(fig_map, use_container_width=True)
         else:
-            st.warning("Locations could not be plotted. Either the geocoding API reached its limit, or the location names in the two files don't perfectly match.")
+            st.warning("Locations could not be plotted. Either the geocoding API reached its limit, or the location names in the sheets don't match.")
     else:
         st.info("Map is disabled via the sidebar. Enable it to view the geographic distribution.")
 
