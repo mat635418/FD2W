@@ -3,28 +3,40 @@ import pandas as pd
 import plotly.express as px
 import requests
 import time
+import os
 
-# --- 1. LOGIN MASK ---
+# --- 1. LOGIN MASK (Using Streamlit Secrets) ---
 if "logged_in" not in st.session_state:
     st.session_state["logged_in"] = False
 
 if not st.session_state["logged_in"]:
     st.title("Login to EMEA Distribution Network App")
+    
+    # Fetch secure credentials from Streamlit Secrets
+    try:
+        SECURE_USER = st.secrets["credentials"]["username"]
+        SECURE_PASS = st.secrets["credentials"]["password"]
+    except KeyError:
+        st.error("⚠️ Secrets not found! Please configure your Streamlit Secrets.")
+        st.stop()
+
     username = st.text_input("Username")
     password = st.text_input("Password", type="password")
+    
     if st.button("Login"):
-        if username == "admin" and password == "goodyear":
+        if username == SECURE_USER and password == SECURE_PASS:
             st.session_state["logged_in"] = True
             st.rerun()
         else:
             st.error("Invalid credentials. Please try again.")
     st.stop()
 
+
 # --- 2. DATA PROCESSING ---
 @st.cache_data
-def load_and_process_data():
-    # Load Pivot Data
-    df_pivot = pd.read_csv('Cube - EMEA SC SE - FC Distribution to Warehouse - V1.xlsx - Pivot.csv', skiprows=8, header=[0,1])
+def load_and_process_data(file_source):
+    # Load Pivot Data from Excel
+    df_pivot = pd.read_excel(file_source, skiprows=8, header=[0,1])
     
     # Fix pandas multi-index columns for merged header cells
     level0 = df_pivot.columns.get_level_values(0).to_series()
@@ -58,19 +70,19 @@ def load_and_process_data():
     return df_agg
 
 @st.cache_data
-def load_locations_and_geocode():
-    # Load Location Data
-    df_loc = pd.read_csv('locations_info.xlsx - Sheet1.csv')
-    df_loc.rename(columns={'Unnamed: 0': 'Location'}, inplace=True)
+def load_locations_and_geocode(file_source):
+    # Load Location Data from Excel
+    df_loc = pd.read_excel(file_source)
+    df_loc.rename(columns={'Unnamed: 0': 'Location', df_loc.columns[0]: 'Location'}, inplace=True)
     
     # Geocode locations via Nominatim API using the address fields
     headers = {'User-Agent': 'GoodYearDistributionApp/1.0'}
     latitudes, longitudes = [], []
     
     for _, row in df_loc.iterrows():
-        street = str(row['street address']) if pd.notna(row['street address']) else ''
-        city = str(row['City']) if pd.notna(row['City']) else ''
-        country = str(row['iso Country']) if pd.notna(row['iso Country']) else ''
+        street = str(row.get('street address', '')) if pd.notna(row.get('street address')) else ''
+        city = str(row.get('City', '')) if pd.notna(row.get('City')) else ''
+        country = str(row.get('iso Country', '')) if pd.notna(row.get('iso Country')) else ''
         
         # Build query string
         query = f"{street} {city} {country}".strip()
@@ -102,13 +114,52 @@ def load_locations_and_geocode():
     df_loc['lon'] = longitudes
     return df_loc
 
-# --- 3. DASHBOARD ---
+
+# --- 3. DATA LOADING DASHBOARD ---
 st.title("EMEA Distribution Network")
 
-# Load Datasets
-with st.spinner("Loading and processing data. Fetching geographic coordinates (this takes a few seconds)..."):
-    df_data = load_and_process_data()
-    df_locations = load_locations_and_geocode()
+if "data_loaded" not in st.session_state:
+    st.session_state["data_loaded"] = False
+
+# Expected Hardcoded filenames on the server
+pivot_name = "Cube - EMEA SC SE - FC Distribution to Warehouse - V1.xlsx"
+loc_name = "locations_info.xlsx"
+
+col1, col2 = st.columns(2)
+
+# Option A: Pre-load files from Repo
+with col1:
+    st.subheader("Automated Mode")
+    if st.button("Load pre-selected FD2W data"):
+        if os.path.exists(pivot_name) and os.path.exists(loc_name):
+            st.session_state['pivot_file'] = pivot_name
+            st.session_state['loc_file'] = loc_name
+            st.session_state["data_loaded"] = True
+        else:
+            st.error(f"Files not found on the server. Please check your GitHub repo to ensure they match exactly: `{pivot_name}` and `{loc_name}`.")
+
+# Option B: Manual Upload
+with col2:
+    st.subheader("Manual Mode")
+    up_pivot = st.file_uploader("Upload Pivot", type=['xlsx'])
+    up_loc = st.file_uploader("Upload Locations", type=['xlsx'])
+    
+    if up_pivot and up_loc:
+        if st.button("Process Uploaded Files"):
+            st.session_state['pivot_file'] = up_pivot
+            st.session_state['loc_file'] = up_loc
+            st.session_state["data_loaded"] = True
+
+# Block execution until data is loaded
+if not st.session_state.get("data_loaded"):
+    st.info("👈 Choose a method above to load the operational data.")
+    st.stop()
+
+
+# --- 4. VISUALIZATION DASHBOARD ---
+with st.spinner("Processing data & fetching geographic coordinates (this takes a few seconds)..."):
+    df_data = load_and_process_data(st.session_state['pivot_file'])
+    df_locations = load_locations_and_geocode(st.session_state['loc_file'])
 
 # Set Color coding
 color_map = {'FWs': '#D8BFD8', 'RDCs': '#FFCCCB', 'LDCs': '#FFFFE0'}
@@ -144,9 +195,12 @@ df_map_data = df_data.groupby(['Location', 'Wh_Role'])['Volume'].sum().reset_ind
 df_map = pd.merge(df_locations, df_map_data, on='Location', how='inner')
 df_map = df_map.dropna(subset=['lat', 'lon'])
 
-fig_map = px.scatter_mapbox(df_map, lat='lat', lon='lon', color='Wh_Role', size='Volume',
-                            hover_name='Location', hover_data=['City', 'Volume'],
-                            color_discrete_map=color_map, zoom=3, height=600,
-                            mapbox_style='carto-positron',
-                            title='Geographical Network (Bubble Size = Volume)')
-st.plotly_chart(fig_map, use_container_width=True)
+if not df_map.empty:
+    fig_map = px.scatter_mapbox(df_map, lat='lat', lon='lon', color='Wh_Role', size='Volume',
+                                hover_name='Location', hover_data=['City', 'Volume'],
+                                color_discrete_map=color_map, zoom=3, height=600,
+                                mapbox_style='carto-positron',
+                                title='Geographical Network (Bubble Size = Volume)')
+    st.plotly_chart(fig_map, use_container_width=True)
+else:
+    st.warning("No geographical data could be mapped. Please verify the city/country spellings in the locations file.")
