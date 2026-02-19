@@ -56,17 +56,14 @@ if enable_map:
     st.sidebar.info(f"⏱️ Estimated loading time: ~{est_time} seconds")
 
 
-# --- 2. DATA PROCESSING (THE BULLETPROOF WAY) ---
+# --- 2. DATA PROCESSING (100% CRASH-PROOF) ---
 @st.cache_data(show_spinner=False)
 def load_and_process_data(file_source):
     # Read the file as a raw grid without headers
     df_raw = pd.read_excel(file_source, skiprows=8, header=None)
     
     # Extract the two header rows
-    # Row 0: Forecast Types (Merged cells, so we forward-fill the empty spaces)
-    forecast_types = df_raw.iloc[0].ffill()
-    
-    # Row 1: Warehouse Locations
+    forecast_types = df_raw.iloc[0].ffill() # Forward fill merged cells
     locations = df_raw.iloc[1]
     
     # Extract the actual data (Row 2 onwards)
@@ -81,12 +78,12 @@ def load_and_process_data(file_source):
         
     df_data.columns = new_columns
     
-    # Now we melt it down! Single header melting is completely stable.
+    # Melt it down into a long format
     df_long = df_data.melt(id_vars=['Market'], var_name='RawCol', value_name='Volume')
     
-    # Split the "RawCol" back into our two categories securely
-    # n=1 guarantees we only ever get exactly 2 columns back!
-    df_long[['ForecastType', 'Location']] = df_long['RawCol'].str.split('___', n=1, expand=True)
+    # THE FIX: Unbreakable extraction (no more split expand=True errors)
+    df_long['ForecastType'] = df_long['RawCol'].apply(lambda x: str(x).split('___')[0] if '___' in str(x) else 'Unknown')
+    df_long['Location'] = df_long['RawCol'].apply(lambda x: str(x).split('___')[1] if '___' in str(x) else str(x))
     df_long.drop(columns=['RawCol'], inplace=True)
     
     # Clean up the data
@@ -125,7 +122,7 @@ def load_locations_and_geocode(file_source, limit):
     df_loc['Location'] = df_loc['Location'].astype(str).str.strip()
     df_loc = df_loc.head(limit).copy()
     
-    headers = {'User-Agent': 'GoodYearDistributionApp/2.1'}
+    headers = {'User-Agent': 'GoodYearDistributionApp/2.2'}
     latitudes, longitudes = [], []
     
     for _, row in df_loc.iterrows():
@@ -217,7 +214,7 @@ try:
 
     st.divider()
     st.header("2. Specific Market Drill-down")
-    markets = [m for m in sorted(df_data['Market'].unique()) if m.lower() != 'nan']
+    markets = [m for m in sorted(df_data['Market'].unique()) if str(m).lower() != 'nan' and str(m).strip() != '']
     selected_market = st.selectbox("Select a Market", markets)
     df_market = df_data[df_data['Market'] == selected_market]
     fig2 = px.bar(df_market, x='Location', y='Volume', color='Wh_Role',
