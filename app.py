@@ -10,14 +10,14 @@ if "logged_in" not in st.session_state:
     st.session_state["logged_in"] = False
 
 if not st.session_state["logged_in"]:
-    st.title("Login to EMEA Distribution Network App")
+    st.title("Login to EMEA FD2W App")
     
     # Fetch secure credentials from Streamlit Secrets
     try:
         SECURE_USER = st.secrets["credentials"]["username"]
         SECURE_PASS = st.secrets["credentials"]["password"]
     except KeyError:
-        st.error("⚠️ Secrets not found! Please configure your Streamlit Secrets.")
+        st.error("⚠️ Secrets not found! Please configure your Streamlit Secrets in the Cloud Settings.")
         st.stop()
 
     username = st.text_input("Username")
@@ -43,16 +43,18 @@ def load_and_process_data(file_source):
     level0 = level0.replace(r'^Unnamed:.*', pd.NA, regex=True).ffill()
     df_pivot.columns = pd.MultiIndex.from_arrays([level0, df_pivot.columns.get_level_values(1)])
     
-    # Rename the first column which contains the market names
-    cols = list(df_pivot.columns)
-    cols[0] = ('Market', 'Market')
-    df_pivot.columns = pd.MultiIndex.from_tuples(cols)
+    # The very first column contains the market names. Set it as the index.
+    first_col = df_pivot.columns[0]
+    df_pivot = df_pivot.set_index(first_col)
+    df_pivot.index.name = 'Market'
     
-    # Melt dataframe to long format
-    df_long = df_pivot.melt(id_vars=[('Market', 'Market')], var_name=['ForecastType', 'Location'], value_name='Volume')
-    df_long.columns = ['Market', 'ForecastType', 'Location', 'Volume']
+    # Name the two levels of our column headers so stacking is clean
+    df_pivot.columns.names = ['ForecastType', 'Location']
     
-    # Clean data
+    # Using .stack() is the safest way to flatten a MultiIndex column in modern pandas
+    df_long = df_pivot.stack(level=['ForecastType', 'Location']).reset_index(name='Volume')
+    
+    # Clean data: drop NAs and zero volume
     df_long = df_long.dropna(subset=['Volume'])
     df_long = df_long[df_long['Volume'] > 0]
     
