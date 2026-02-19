@@ -4,14 +4,14 @@ import plotly.express as px
 import os
 import traceback
 
-st.set_page_config(page_title="EMEA FD2W App", layout="wide")
+st.set_page_config(page_title="EMEA SC SE Network", layout="wide")
 
 # --- 1. LOGIN MASK ---
 if "logged_in" not in st.session_state:
     st.session_state["logged_in"] = False
 
 if not st.session_state["logged_in"]:
-    st.title("Login to EMEA FD2W App")
+    st.title("Login to EMEA Distribution Network App")
     
     try:
         SECURE_USER = st.secrets.get("credentials", {}).get("username", "admin")
@@ -237,10 +237,7 @@ try:
                                         hover_data={'lat': False, 'lon': False, 'Wh_Role': True, 'Formatted_Volume': True, 'Volume': False},
                                         color_discrete_map=color_map, zoom=3.5, height=750,
                                         mapbox_style='open-street-map',
-                                        size_max=50) 
-            
-            # FEATURE: Adding dark borders around the light-colored bubbles so they stand out clearly
-            fig_map.update_traces(marker=dict(line=dict(width=1.5, color='DarkSlateGrey')))
+                                        size_max=50, opacity=0.9) # Added opacity instead of border line
             
             st.plotly_chart(fig_map, use_container_width=True)
             st.caption(f"Showing {len(df_map['Location'].unique())} unique locations.")
