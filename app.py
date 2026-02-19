@@ -37,28 +37,68 @@ if not st.session_state["logged_in"]:
 # --- 2. DATA PROCESSING ---
 @st.cache_data
 def load_and_process_data(file_source):
-    """Load the multi-level header Excel file"""
+    """Load the Excel file - find where actual data starts"""
     
-    # Read with multi-index columns (2 header rows after skipping 8 rows)
-    df = pd.read_excel(file_source, skiprows=8, header=[0, 1])
+    # First, read without headers to find where data starts
+    df_raw = pd.read_excel(file_source, header=None)
     
-    # Get column levels
-    level0 = df.columns.get_level_values(0)
-    level1 = df.columns.get_level_values(1)
+    # Find the row that contains "Market" or similar header
+    data_start_row = None
+    for idx, row in df_raw.iterrows():
+        # Convert row to string and check for market-like content
+        row_str = ' '.join(row.astype(str).values)
+        if 'Forecast' in row_str or 'forecast' in row_str:
+            data_start_row = idx
+            break
     
-    # First column pair contains the market names - extract it
-    first_col_tuple = df.columns[0]
+    if data_start_row is None:
+        # If not found, try looking for country codes or market names
+        for idx, row in df_raw.iterrows():
+            first_val = str(row.iloc[0]) if pd.notna(row.iloc[0]) else ''
+            # Look for patterns like country codes or "Market"
+            if len(first_val) > 0 and first_val not in ['Excel Template Version', 'V1', 'nan', '']:
+                data_start_row = idx
+                break
     
-    # Rename first column to 'Market' by creating new columns
-    new_columns = [('Market', 'Market') if i == 0 else col for i, col in enumerate(df.columns)]
-    df.columns = pd.MultiIndex.from_tuples(new_columns)
+    if data_start_row is None:
+        st.error("Could not find data start in Excel file")
+        st.stop()
     
-    # Set Market as index
-    df = df.set_index(('Market', 'Market'))
-    df.index.name = 'Market'
+    # Now read with proper headers from the identified row
+    # The data has 2 header rows (Forecast Type and Location)
+    df = pd.read_excel(file_source, skiprows=data_start_row, header=[0, 1])
     
-    # Now stack the multi-level columns
-    df_long = df.stack([0, 1]).reset_index()
+    # Get the first column name (which is the Market column)
+    first_col = df.columns[0]
+    
+    # Separate the Market column from the rest
+    markets = df[first_col].copy()
+    df_values = df.drop(columns=[first_col])
+    
+    # Clean up column names - forward fill the level 0 (Forecast Type)
+    new_level0 = []
+    last_valid = None
+    for col in df_values.columns.get_level_values(0):
+        if 'Unnamed' not in str(col) and pd.notna(col) and str(col).strip() != '':
+            last_valid = col
+        new_level0.append(last_valid)
+    
+    # Reconstruct columns
+    df_values.columns = pd.MultiIndex.from_arrays([
+        new_level0,
+        df_values.columns.get_level_values(1)
+    ], names=['ForecastType', 'Location'])
+    
+    # Add markets back as index
+    df_values.index = markets
+    df_values.index.name = 'Market'
+    
+    # Remove rows where Market is null or empty
+    df_values = df_values[df_values.index.notna()]
+    df_values = df_values[df_values.index.astype(str).str.strip() != '']
+    
+    # Stack to long format
+    df_long = df_values.stack([0, 1]).reset_index()
     df_long.columns = ['Market', 'ForecastType', 'Location', 'Volume']
     
     # Convert Volume to numeric
@@ -68,14 +108,11 @@ def load_and_process_data(file_source):
     df_long = df_long.dropna(subset=['Volume'])
     df_long = df_long[df_long['Volume'] > 0]
     
-    # Clean up ForecastType names (remove "Unnamed" entries)
-    df_long['ForecastType'] = df_long['ForecastType'].str.replace(r'Unnamed.*', '', regex=True).str.strip()
-    
-    # Map Forecast Types to Warehouse Roles
+    # Map Forecast Types to Warehouse Roles (flexible matching)
     df_long['Wh_Role'] = 'Unknown'
-    df_long.loc[df_long['ForecastType'].str.contains('LDC', case=False, na=False), 'Wh_Role'] = 'LDCs'
-    df_long.loc[df_long['ForecastType'].str.contains('RDC', case=False, na=False), 'Wh_Role'] = 'RDCs'
-    df_long.loc[df_long['ForecastType'].str.contains('Factory|FW', case=False, na=False), 'Wh_Role'] = 'FWs'
+    df_long.loc[df_long['ForecastType'].astype(str).str.contains('LDC', case=False, na=False), 'Wh_Role'] = 'LDCs'
+    df_long.loc[df_long['ForecastType'].astype(str).str.contains('RDC', case=False, na=False), 'Wh_Role'] = 'RDCs'
+    df_long.loc[df_long['ForecastType'].astype(str).str.contains('Factory|FW', case=False, na=False), 'Wh_Role'] = 'FWs'
     
     # Remove unknown roles
     df_long = df_long[df_long['Wh_Role'] != 'Unknown']
@@ -91,20 +128,36 @@ def load_locations(file_source):
     """Load the locations table"""
     df = pd.read_excel(file_source)
     
-    # Rename columns to what we expect
-    # Column 0: Full name, Column 1: Code, etc.
-    col_names = ['FullName', 'Location', 'StreetAddress', 'POBox', 'PostalCode', 'City', 'Country']
+    # Get column names - handle if first column is unnamed
+    columns = df.columns.tolist()
     
-    # Only rename if we have enough columns
-    if len(df.columns) >= len(col_names):
-        df.columns = col_names + list(df.columns[len(col_names):])
-    else:
-        # Try to identify key columns
-        for i, col in enumerate(df.columns):
-            if i == 0:
-                df.rename(columns={col: 'FullName'}, inplace=True)
-            elif i == 1:
-                df.rename(columns={col: 'Location'}, inplace=True)
+    # Expected structure based on your image:
+    # Col 0: Full name (like "AE01 - Goodyear Dubai")
+    # Col 1: Location code (like "AE01")
+    # Col 2: Street address
+    # Col 3: PO Box
+    # Col 4: Postal Code
+    # Col 5: City
+    # Col 6: Country code
+    
+    col_mapping = {}
+    for i, col in enumerate(columns):
+        if i == 0:
+            col_mapping[col] = 'FullName'
+        elif i == 1:
+            col_mapping[col] = 'Location'
+        elif i == 2:
+            col_mapping[col] = 'StreetAddress'
+        elif i == 3:
+            col_mapping[col] = 'POBox'
+        elif i == 4:
+            col_mapping[col] = 'PostalCode'
+        elif i == 5:
+            col_mapping[col] = 'City'
+        elif i == 6:
+            col_mapping[col] = 'Country'
+    
+    df.rename(columns=col_mapping, inplace=True)
     
     return df
 
@@ -154,7 +207,7 @@ def geocode_locations(df_loc, max_locations=50):
             latitudes.append(None)
             longitudes.append(None)
         
-        time.sleep(1)  # Respect API rate limit
+        time.sleep(1)
     
     progress_bar.empty()
     status_text.empty()
@@ -213,41 +266,18 @@ try:
         df_locations = load_locations(locations_file)
     
     if df_data.empty:
-        st.error("❌ No data after processing. Please check the Excel file structure.")
-        
-        # Debug: show raw file structure
-        with st.expander("🔍 Debug: Raw File Structure"):
-            raw_df = pd.read_excel(pivot_file, skiprows=8, header=[0, 1], nrows=5)
-            st.write("**Column structure:**")
-            st.write(raw_df.columns.tolist())
-            st.write("**First few rows:**")
-            st.dataframe(raw_df)
+        st.error("❌ No data after processing.")
         st.stop()
     
-    st.sidebar.success(f"✅ Loaded {len(df_data)} data rows")
-    st.sidebar.success(f"✅ Loaded {len(df_locations)} locations")
+    st.sidebar.success(f"✅ {len(df_data)} data rows")
+    st.sidebar.success(f"✅ {len(df_locations)} locations")
 
 except Exception as e:
-    st.error(f"❌ Error loading data: {str(e)}")
+    st.error(f"❌ Error: {str(e)}")
     
-    # Show more debug info
-    with st.expander("🐛 Debug Information"):
-        st.write("**Error details:**")
-        st.code(str(e))
-        
-        try:
-            st.write("**Trying to read first few rows of data file:**")
-            debug_df = pd.read_excel(pivot_file, nrows=15)
-            st.dataframe(debug_df)
-        except:
-            st.write("Could not read data file at all")
-        
-        try:
-            st.write("**Trying to read locations file:**")
-            debug_loc = pd.read_excel(locations_file, nrows=10)
-            st.dataframe(debug_loc)
-        except:
-            st.write("Could not read locations file at all")
+    with st.expander("🐛 Debug"):
+        import traceback
+        st.code(traceback.format_exc())
     
     st.stop()
 
@@ -276,7 +306,7 @@ st.plotly_chart(fig1, use_container_width=True)
 # Summary metrics
 col1, col2, col3 = st.columns(3)
 with col1:
-    st.metric("📍 Total Markets", len(df_data['Market'].unique()))
+    st.metric("📍 Markets", len(df_data['Market'].unique()))
 with col2:
     st.metric("📦 Total Volume", f"{df_data['Volume'].sum():,.0f}")
 with col3:
@@ -342,15 +372,9 @@ if enable_map:
         )
         st.plotly_chart(fig_map, use_container_width=True)
         
-        st.success(f"✅ Mapped {len(df_map)} locations with volume data")
+        st.success(f"✅ Mapped {len(df_map)} locations")
     else:
-        st.warning("⚠️ No locations could be mapped. Location codes may not match between files.")
-        
-        with st.expander("🔍 Debug: Location Matching"):
-            st.write("**Locations in volume data:**")
-            st.write(sorted(df_data['Location'].unique())[:20])
-            st.write("**Locations in location file:**")
-            st.write(sorted(df_locations['Location'].unique())[:20])
+        st.warning("⚠️ No locations matched between files")
 else:
     st.info("ℹ️ Map disabled. Enable in sidebar to view.")
 
@@ -359,7 +383,7 @@ else:
 st.divider()
 st.header("📋 4. Data Explorer")
 
-with st.expander("🔍 View Raw Data"):
+with st.expander("🔍 View Data Tables"):
     tab1, tab2 = st.tabs(["Volume Data", "Locations"])
     
     with tab1:
