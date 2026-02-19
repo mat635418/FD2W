@@ -165,7 +165,7 @@ try:
     color_map = {'FWs': '#D8BFD8', 'RDCs': '#FFCCCB', 'LDCs': '#FFFFE0'}
 
     # FEATURE: KPI Ribbon
-    st.title("📦 EMEA Distribution Network Dashboard")
+    st.title("📦 EMEA FD2W App")
     st.markdown("---")
     
     total_vol = df_data['Volume'].sum()
