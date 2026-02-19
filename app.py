@@ -72,20 +72,21 @@ def load_and_process_data(file_source):
     # Extract the actual data (Row 2 onwards)
     df_data = df_raw.iloc[2:].copy()
     
-    # Build a single flat list of unique column names: "ForecastType||Location"
+    # Build a single flat list of unique column names using a regex-safe separator
     new_columns = ['Market'] # The first column is always the Market
     for i in range(1, len(df_raw.columns)):
         ft = str(forecast_types[i]).strip()
         loc = str(locations[i]).strip()
-        new_columns.append(f"{ft}||{loc}")
+        new_columns.append(f"{ft}___{loc}")
         
     df_data.columns = new_columns
     
     # Now we melt it down! Single header melting is completely stable.
     df_long = df_data.melt(id_vars=['Market'], var_name='RawCol', value_name='Volume')
     
-    # Split the "RawCol" back into our two categories
-    df_long[['ForecastType', 'Location']] = df_long['RawCol'].str.split('||', expand=True)
+    # Split the "RawCol" back into our two categories securely
+    # n=1 guarantees we only ever get exactly 2 columns back!
+    df_long[['ForecastType', 'Location']] = df_long['RawCol'].str.split('___', n=1, expand=True)
     df_long.drop(columns=['RawCol'], inplace=True)
     
     # Clean up the data
@@ -124,7 +125,7 @@ def load_locations_and_geocode(file_source, limit):
     df_loc['Location'] = df_loc['Location'].astype(str).str.strip()
     df_loc = df_loc.head(limit).copy()
     
-    headers = {'User-Agent': 'GoodYearDistributionApp/2.0'}
+    headers = {'User-Agent': 'GoodYearDistributionApp/2.1'}
     latitudes, longitudes = [], []
     
     for _, row in df_loc.iterrows():
@@ -178,7 +179,7 @@ if not st.session_state.get("data_loaded"):
                 st.session_state["data_loaded"] = True
                 st.rerun() 
             else:
-                st.error(f"Files not found on server. Ensure exact names: `{pivot_name}`")
+                st.error(f"Files not found on server. Ensure exact names: `{pivot_name}` and `{loc_name}`")
 
     with col2:
         st.subheader("Manual Mode")
