@@ -12,7 +12,6 @@ if "logged_in" not in st.session_state:
 if not st.session_state["logged_in"]:
     st.title("Login to EMEA Distribution Network App")
     
-    # Fetch secure credentials from Streamlit Secrets
     try:
         SECURE_USER = st.secrets["credentials"]["username"]
         SECURE_PASS = st.secrets["credentials"]["password"]
@@ -38,27 +37,28 @@ def load_and_process_data(file_source):
     # Load Pivot Data from Excel
     df_pivot = pd.read_excel(file_source, skiprows=8, header=[0,1])
     
-    # Fix pandas multi-index columns for merged header cells
+    # Fix multi-index columns
     level0 = df_pivot.columns.get_level_values(0).to_series()
     level0 = level0.replace(r'^Unnamed:.*', pd.NA, regex=True).ffill()
     df_pivot.columns = pd.MultiIndex.from_arrays([level0, df_pivot.columns.get_level_values(1)])
     
-    # The very first column contains the market names. Set it as the index.
+    # Set first column as Market
     first_col = df_pivot.columns[0]
     df_pivot = df_pivot.set_index(first_col)
     df_pivot.index.name = 'Market'
-    
-    # Name the two levels of our column headers so stacking is clean
     df_pivot.columns.names = ['ForecastType', 'Location']
     
-    # Using .stack() is the safest way to flatten a MultiIndex column in modern pandas
-    df_long = df_pivot.stack(level=['ForecastType', 'Location']).reset_index(name='Volume')
+    # Flatten MultiIndex
+    df_long = df_pivot.stack(level=['ForecastType', 'Location'], future_stack=True).reset_index(name='Volume')
+    
+    # FIX: Convert Volume to numeric, forcing errors (like spaces or strings) to NaN
+    df_long['Volume'] = pd.to_numeric(df_long['Volume'], errors='coerce')
     
     # Clean data: drop NAs and zero volume
     df_long = df_long.dropna(subset=['Volume'])
     df_long = df_long[df_long['Volume'] > 0]
     
-    # Map ForecastType to Warehouse Roles (Summing up LDC and LDC split)
+    # Map ForecastType to Warehouse Roles
     role_mapping = {
         'Forecast at LDC': 'LDCs',
         'Forecast at LDC (area split)': 'LDCs',
@@ -67,26 +67,29 @@ def load_and_process_data(file_source):
     }
     df_long['Wh_Role'] = df_long['ForecastType'].map(role_mapping)
     
-    # Group by Market, Role, and Location to combine "LDC" and "LDC split"
+    # Combine LDC + LDC Split
     df_agg = df_long.groupby(['Market', 'Wh_Role', 'Location'])['Volume'].sum().reset_index()
     return df_agg
 
 @st.cache_data
 def load_locations_and_geocode(file_source):
-    # Load Location Data from Excel
     df_loc = pd.read_excel(file_source)
-    df_loc.rename(columns={'Unnamed: 0': 'Location', df_loc.columns[0]: 'Location'}, inplace=True)
     
-    # Geocode locations via Nominatim API using the address fields
-    headers = {'User-Agent': 'GoodYearDistributionApp/1.0'}
+    # Robust column naming
+    if 'location' in df_loc.columns:
+        df_loc.rename(columns={'location': 'Location'}, inplace=True)
+    else:
+        df_loc.rename(columns={df_loc.columns[0]: 'Location'}, inplace=True)
+    
+    headers = {'User-Agent': 'GoodYearDistributionApp/1.1'}
     latitudes, longitudes = [], []
     
     for _, row in df_loc.iterrows():
+        # Get address parts safely
         street = str(row.get('street address', '')) if pd.notna(row.get('street address')) else ''
         city = str(row.get('City', '')) if pd.notna(row.get('City')) else ''
         country = str(row.get('iso Country', '')) if pd.notna(row.get('iso Country')) else ''
         
-        # Build query string
         query = f"{street} {city} {country}".strip()
         url = f"https://nominatim.openstreetmap.org/search?q={query}&format=json&limit=1"
         
@@ -96,40 +99,37 @@ def load_locations_and_geocode(file_source):
                 latitudes.append(float(r[0]['lat']))
                 longitudes.append(float(r[0]['lon']))
             else:
-                # Fallback to City + Country
-                query_fallback = f"{city} {country}".strip()
-                url_fallback = f"https://nominatim.openstreetmap.org/search?q={query_fallback}&format=json&limit=1"
-                r_fallback = requests.get(url_fallback, headers=headers).json()
-                if r_fallback:
-                    latitudes.append(float(r_fallback[0]['lat']))
-                    longitudes.append(float(r_fallback[0]['lon']))
+                # Fallback to just City/Country
+                query_fb = f"{city} {country}".strip()
+                r_fb = requests.get(f"https://nominatim.openstreetmap.org/search?q={query_fb}&format=json&limit=1", headers=headers).json()
+                if r_fb:
+                    latitudes.append(float(r_fb[0]['lat']))
+                    longitudes.append(float(r_fb[0]['lon']))
                 else:
-                    latitudes.append(None)
-                    longitudes.append(None)
-        except Exception:
-            latitudes.append(None)
-            longitudes.append(None)
+                    latitudes.append(None); longitudes.append(None)
+        except:
+            latitudes.append(None); longitudes.append(None)
             
-        time.sleep(1) # Delay requested by Nominatim policy
+        time.sleep(1) # Required by Nominatim
         
     df_loc['lat'] = latitudes
     df_loc['lon'] = longitudes
     return df_loc
 
 
-# --- 3. DATA LOADING DASHBOARD ---
+# --- 3. UI LAYOUT ---
+st.set_page_config(page_title="EMEA SC SE Network", layout="wide")
 st.title("EMEA Distribution Network")
 
 if "data_loaded" not in st.session_state:
     st.session_state["data_loaded"] = False
 
-# Expected Hardcoded filenames on the server
+# Repo filenames
 pivot_name = "Cube - EMEA SC SE - FC Distribution to Warehouse - V1.xlsx"
 loc_name = "locations_info.xlsx"
 
 col1, col2 = st.columns(2)
 
-# Option A: Pre-load files from Repo
 with col1:
     st.subheader("Automated Mode")
     if st.button("Load pre-selected FD2W data"):
@@ -138,71 +138,55 @@ with col1:
             st.session_state['loc_file'] = loc_name
             st.session_state["data_loaded"] = True
         else:
-            st.error(f"Files not found on the server. Please check your GitHub repo to ensure they match exactly: `{pivot_name}` and `{loc_name}`.")
+            st.error("Pre-selected files not found on server.")
 
-# Option B: Manual Upload
 with col2:
     st.subheader("Manual Mode")
-    up_pivot = st.file_uploader("Upload Pivot", type=['xlsx'])
-    up_loc = st.file_uploader("Upload Locations", type=['xlsx'])
-    
+    up_pivot = st.file_uploader("Upload Pivot XLSX", type=['xlsx'])
+    up_loc = st.file_uploader("Upload Locations XLSX", type=['xlsx'])
     if up_pivot and up_loc:
         if st.button("Process Uploaded Files"):
             st.session_state['pivot_file'] = up_pivot
             st.session_state['loc_file'] = up_loc
             st.session_state["data_loaded"] = True
 
-# Block execution until data is loaded
 if not st.session_state.get("data_loaded"):
-    st.info("👈 Choose a method above to load the operational data.")
+    st.info("Please select a data source to begin.")
     st.stop()
 
-
-# --- 4. VISUALIZATION DASHBOARD ---
-with st.spinner("Processing data & fetching geographic coordinates (this takes a few seconds)..."):
+# --- 4. DASHBOARD ---
+with st.spinner("Processing data..."):
     df_data = load_and_process_data(st.session_state['pivot_file'])
     df_locations = load_locations_and_geocode(st.session_state['loc_file'])
 
-# Set Color coding
 color_map = {'FWs': '#D8BFD8', 'RDCs': '#FFCCCB', 'LDCs': '#FFFFE0'}
 
-# Visual 1: View by Market and Wh.Role level
-st.header("1. Volume by Market and Warehouse Role")
+# Section 1: Overall Network
+st.header("1. EMEA Network View (Market & Wh Role)")
 df_market_role = df_data.groupby(['Market', 'Wh_Role'])['Volume'].sum().reset_index()
-
 fig1 = px.bar(df_market_role, x='Market', y='Volume', color='Wh_Role', 
-              color_discrete_map=color_map, title='Market Distribution Overview',
-              barmode='stack')
+              color_discrete_map=color_map, barmode='stack')
 st.plotly_chart(fig1, use_container_width=True)
 
+# Section 2: Market Selection
 st.divider()
-
-# Visual 2: Drill down into a specific market
-st.header("2. Detailed Split by Specific Market")
-markets = df_data['Market'].unique()
-selected_market = st.selectbox("Select a Market", sorted(markets))
-
+st.header("2. Specific Market Drill-down")
+selected_market = st.selectbox("Select a Market", sorted(df_data['Market'].unique()))
 df_market = df_data[df_data['Market'] == selected_market]
 fig2 = px.bar(df_market, x='Location', y='Volume', color='Wh_Role',
-              color_discrete_map=color_map, 
-              title=f'Location vs Role Distribution for {selected_market}')
+              color_discrete_map=color_map, title=f"Location Detail: {selected_market}")
 st.plotly_chart(fig2, use_container_width=True)
 
+# Section 3: Geographic Map
 st.divider()
-
-# Visual 3: Geographic Map
-st.header("3. Interactive Distribution Map")
-# Merge volumes with geocoded locations
-df_map_data = df_data.groupby(['Location', 'Wh_Role'])['Volume'].sum().reset_index()
-df_map = pd.merge(df_locations, df_map_data, on='Location', how='inner')
-df_map = df_map.dropna(subset=['lat', 'lon'])
+st.header("3. Geographical Network Map")
+df_map_agg = df_data.groupby(['Location', 'Wh_Role'])['Volume'].sum().reset_index()
+df_map = pd.merge(df_locations, df_map_agg, on='Location', how='inner').dropna(subset=['lat', 'lon'])
 
 if not df_map.empty:
     fig_map = px.scatter_mapbox(df_map, lat='lat', lon='lon', color='Wh_Role', size='Volume',
-                                hover_name='Location', hover_data=['City', 'Volume'],
-                                color_discrete_map=color_map, zoom=3, height=600,
-                                mapbox_style='carto-positron',
-                                title='Geographical Network (Bubble Size = Volume)')
+                                hover_name='Location', color_discrete_map=color_map,
+                                zoom=3, height=700, mapbox_style='carto-positron')
     st.plotly_chart(fig_map, use_container_width=True)
 else:
-    st.warning("No geographical data could be mapped. Please verify the city/country spellings in the locations file.")
+    st.warning("Could not geocode any locations. Check your address data.")
