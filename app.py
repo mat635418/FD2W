@@ -38,17 +38,28 @@ if not st.session_state["logged_in"]:
 @st.cache_data
 def load_and_process_data(file_source):
     """Load the multi-level header Excel file"""
-    # Read Excel - the first 8 rows are metadata, then 2 header rows
-    df = pd.read_excel(file_source, header=[8, 9])
     
-    # The first column is the Market name (has a merged header)
-    # All other columns are (ForecastType, Location) pairs
-    market_col = df.columns[0]
-    df = df.rename(columns={market_col: 'Market'})
+    # Read with multi-index columns (2 header rows after skipping 8 rows)
+    df = pd.read_excel(file_source, skiprows=8, header=[0, 1])
     
-    # Convert from wide to long format
-    # Stack all columns except the first one (Market)
-    df_long = df.melt(id_vars='Market', var_name=['ForecastType', 'Location'], value_name='Volume')
+    # Get column levels
+    level0 = df.columns.get_level_values(0)
+    level1 = df.columns.get_level_values(1)
+    
+    # First column pair contains the market names - extract it
+    first_col_tuple = df.columns[0]
+    
+    # Rename first column to 'Market' by creating new columns
+    new_columns = [('Market', 'Market') if i == 0 else col for i, col in enumerate(df.columns)]
+    df.columns = pd.MultiIndex.from_tuples(new_columns)
+    
+    # Set Market as index
+    df = df.set_index(('Market', 'Market'))
+    df.index.name = 'Market'
+    
+    # Now stack the multi-level columns
+    df_long = df.stack([0, 1]).reset_index()
+    df_long.columns = ['Market', 'ForecastType', 'Location', 'Volume']
     
     # Convert Volume to numeric
     df_long['Volume'] = pd.to_numeric(df_long['Volume'], errors='coerce')
@@ -57,19 +68,19 @@ def load_and_process_data(file_source):
     df_long = df_long.dropna(subset=['Volume'])
     df_long = df_long[df_long['Volume'] > 0]
     
+    # Clean up ForecastType names (remove "Unnamed" entries)
+    df_long['ForecastType'] = df_long['ForecastType'].str.replace(r'Unnamed.*', '', regex=True).str.strip()
+    
     # Map Forecast Types to Warehouse Roles
-    role_mapping = {
-        'Forecast at LDC': 'LDCs',
-        'Forecast at LDC (area split)': 'LDCs',
-        'Forecast at RDC': 'RDCs',
-        'Forecast at Factory Warehouse': 'FWs'
-    }
-    df_long['Wh_Role'] = df_long['ForecastType'].map(role_mapping)
+    df_long['Wh_Role'] = 'Unknown'
+    df_long.loc[df_long['ForecastType'].str.contains('LDC', case=False, na=False), 'Wh_Role'] = 'LDCs'
+    df_long.loc[df_long['ForecastType'].str.contains('RDC', case=False, na=False), 'Wh_Role'] = 'RDCs'
+    df_long.loc[df_long['ForecastType'].str.contains('Factory|FW', case=False, na=False), 'Wh_Role'] = 'FWs'
     
-    # Remove unmapped roles
-    df_long = df_long.dropna(subset=['Wh_Role'])
+    # Remove unknown roles
+    df_long = df_long[df_long['Wh_Role'] != 'Unknown']
     
-    # Aggregate (to combine LDC + LDC split)
+    # Aggregate
     df_agg = df_long.groupby(['Market', 'Wh_Role', 'Location'])['Volume'].sum().reset_index()
     
     return df_agg
@@ -80,9 +91,20 @@ def load_locations(file_source):
     """Load the locations table"""
     df = pd.read_excel(file_source)
     
-    # The first column (index 0) has the full location name like "AE01 - Goodyear Dubai"
-    # The second column is the location code like "AE01"
-    df.columns = ['FullName', 'Location', 'StreetAddress', 'POBox', 'PostalCode', 'City', 'Country']
+    # Rename columns to what we expect
+    # Column 0: Full name, Column 1: Code, etc.
+    col_names = ['FullName', 'Location', 'StreetAddress', 'POBox', 'PostalCode', 'City', 'Country']
+    
+    # Only rename if we have enough columns
+    if len(df.columns) >= len(col_names):
+        df.columns = col_names + list(df.columns[len(col_names):])
+    else:
+        # Try to identify key columns
+        for i, col in enumerate(df.columns):
+            if i == 0:
+                df.rename(columns={col: 'FullName'}, inplace=True)
+            elif i == 1:
+                df.rename(columns={col: 'Location'}, inplace=True)
     
     return df
 
@@ -90,6 +112,10 @@ def load_locations(file_source):
 @st.cache_data
 def geocode_locations(df_loc, max_locations=50):
     """Geocode locations using City and Country"""
+    
+    if 'City' not in df_loc.columns or 'Country' not in df_loc.columns:
+        st.warning("City or Country column not found in locations file")
+        return df_loc
     
     df_loc = df_loc.head(max_locations).copy()
     
@@ -101,13 +127,19 @@ def geocode_locations(df_loc, max_locations=50):
     
     total = len(df_loc)
     for idx, row in df_loc.iterrows():
-        status_text.text(f"🌐 Geocoding {idx+1}/{total}: {row['City']}, {row['Country']}")
+        city = str(row.get('City', '')) if pd.notna(row.get('City')) else ''
+        country = str(row.get('Country', '')) if pd.notna(row.get('Country')) else ''
+        
+        status_text.text(f"🌐 Geocoding {idx+1}/{total}: {city}, {country}")
         progress_bar.progress((idx + 1) / total)
         
-        city = str(row['City']) if pd.notna(row['City']) else ''
-        country = str(row['Country']) if pd.notna(row['Country']) else ''
+        query = f"{city}, {country}".strip(', ')
         
-        query = f"{city}, {country}".strip()
+        if not query:
+            latitudes.append(None)
+            longitudes.append(None)
+            continue
+        
         url = f"https://nominatim.openstreetmap.org/search?q={query}&format=json&limit=1"
         
         try:
@@ -130,6 +162,9 @@ def geocode_locations(df_loc, max_locations=50):
     df_loc['lat'] = latitudes
     df_loc['lon'] = longitudes
     
+    valid = df_loc[['lat', 'lon']].notna().all(axis=1).sum()
+    st.sidebar.success(f"✅ Geocoded: {valid}/{len(df_loc)} locations")
+    
     return df_loc
 
 
@@ -151,16 +186,16 @@ if not os.path.exists(locations_file):
 
 # Map settings
 st.sidebar.header("🗺️ Map Settings")
-enable_map = st.sidebar.checkbox("Enable Interactive Map", value=True)
+enable_map = st.sidebar.checkbox("Enable Interactive Map", value=False)
 
 if enable_map:
     max_locations = st.sidebar.slider(
         "Locations to geocode",
         min_value=10,
         max_value=100,
-        value=40,
+        value=30,
         step=5,
-        help="More locations = longer load time"
+        help="More locations = longer load time (~1s each)"
     )
     
     est_time = max_locations * 1.2
@@ -172,16 +207,50 @@ else:
 # --- 4. LOAD DATA ---
 st.title("🌍 EMEA Distribution Network")
 
-with st.spinner("📊 Loading data..."):
-    df_data = load_and_process_data(pivot_file)
-    df_locations = load_locations(locations_file)
+try:
+    with st.spinner("📊 Loading data..."):
+        df_data = load_and_process_data(pivot_file)
+        df_locations = load_locations(locations_file)
+    
+    if df_data.empty:
+        st.error("❌ No data after processing. Please check the Excel file structure.")
+        
+        # Debug: show raw file structure
+        with st.expander("🔍 Debug: Raw File Structure"):
+            raw_df = pd.read_excel(pivot_file, skiprows=8, header=[0, 1], nrows=5)
+            st.write("**Column structure:**")
+            st.write(raw_df.columns.tolist())
+            st.write("**First few rows:**")
+            st.dataframe(raw_df)
+        st.stop()
+    
+    st.sidebar.success(f"✅ Loaded {len(df_data)} data rows")
+    st.sidebar.success(f"✅ Loaded {len(df_locations)} locations")
 
-if df_data.empty:
-    st.error("❌ No data loaded. Check Excel file format.")
+except Exception as e:
+    st.error(f"❌ Error loading data: {str(e)}")
+    
+    # Show more debug info
+    with st.expander("🐛 Debug Information"):
+        st.write("**Error details:**")
+        st.code(str(e))
+        
+        try:
+            st.write("**Trying to read first few rows of data file:**")
+            debug_df = pd.read_excel(pivot_file, nrows=15)
+            st.dataframe(debug_df)
+        except:
+            st.write("Could not read data file at all")
+        
+        try:
+            st.write("**Trying to read locations file:**")
+            debug_loc = pd.read_excel(locations_file, nrows=10)
+            st.dataframe(debug_loc)
+        except:
+            st.write("Could not read locations file at all")
+    
     st.stop()
 
-st.sidebar.success(f"✅ Loaded {len(df_data)} data rows")
-st.sidebar.success(f"✅ Loaded {len(df_locations)} locations")
 
 # Color scheme
 color_map = {'FWs': '#D8BFD8', 'RDCs': '#FFCCCB', 'LDCs': '#FFFFE0'}
@@ -246,7 +315,6 @@ if enable_map:
         df_locations_geo = geocode_locations(df_locations, max_locations)
     
     # Merge volume data with coordinates
-    # Match on Location code
     df_map_data = df_data.groupby(['Location', 'Wh_Role'])['Volume'].sum().reset_index()
     
     df_map = pd.merge(
@@ -277,6 +345,12 @@ if enable_map:
         st.success(f"✅ Mapped {len(df_map)} locations with volume data")
     else:
         st.warning("⚠️ No locations could be mapped. Location codes may not match between files.")
+        
+        with st.expander("🔍 Debug: Location Matching"):
+            st.write("**Locations in volume data:**")
+            st.write(sorted(df_data['Location'].unique())[:20])
+            st.write("**Locations in location file:**")
+            st.write(sorted(df_locations['Location'].unique())[:20])
 else:
     st.info("ℹ️ Map disabled. Enable in sidebar to view.")
 
@@ -289,7 +363,7 @@ with st.expander("🔍 View Raw Data"):
     tab1, tab2 = st.tabs(["Volume Data", "Locations"])
     
     with tab1:
-        st.dataframe(df_data.sort_values('Volume', ascending=False), use_container_width=True)
+        st.dataframe(df_data.sort_values('Volume', ascending=False), use_container_width=True, height=400)
     
     with tab2:
-        st.dataframe(df_locations, use_container_width=True)
+        st.dataframe(df_locations, use_container_width=True, height=400)
