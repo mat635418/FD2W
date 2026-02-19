@@ -1,19 +1,17 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-import requests
-import time
 import os
 import traceback
 
-st.set_page_config(page_title="EMEA SC SE Network", layout="wide")
+st.set_page_config(page_title="EMEA FD2W App", layout="wide")
 
 # --- 1. LOGIN MASK ---
 if "logged_in" not in st.session_state:
     st.session_state["logged_in"] = False
 
 if not st.session_state["logged_in"]:
-    st.title("Login to EMEA Distribution Network App")
+    st.title("Login to EMEA FD2W App")
     
     try:
         SECURE_USER = st.secrets.get("credentials", {}).get("username", "admin")
@@ -33,7 +31,7 @@ if not st.session_state["logged_in"]:
             st.error("Invalid credentials. Please try again.")
     st.stop()
 
-# --- SIDEBAR & COMPLEXITY SETTINGS ---
+# --- SIDEBAR SETTINGS ---
 st.sidebar.header("⚙️ Dashboard Settings")
 
 if st.sidebar.button("📂 Change Data Source"):
@@ -46,14 +44,8 @@ if st.sidebar.button("🔄 Clear Cache & Reload Data"):
     st.rerun()
 
 st.sidebar.divider()
-st.sidebar.subheader("Map Complexity")
-enable_map = st.sidebar.checkbox("Enable Geographical Map", value=True, help="Disable to skip geocoding and load instantly.")
-
-max_locations = 40
-if enable_map:
-    max_locations = st.sidebar.slider("Locations to Geocode", min_value=5, max_value=100, value=40, step=5)
-    est_time = int(max_locations * 0.8)
-    st.sidebar.info(f"⏱️ Estimated map loading time: ~{est_time} seconds (unique cities only)")
+st.sidebar.subheader("Map Settings")
+enable_map = st.sidebar.checkbox("Show Geographical Map", value=True)
 
 
 # --- 2. DATA PROCESSING ---
@@ -105,7 +97,7 @@ def load_and_process_data(file_source):
 
 
 @st.cache_data(show_spinner=False)
-def load_locations_and_geocode(file_source, limit):
+def load_locations(file_source):
     df_loc = pd.read_excel(file_source, sheet_name='Sheet1')
     
     # Safely find the actual "location" column regardless of leading empty columns
@@ -114,46 +106,22 @@ def load_locations_and_geocode(file_source, limit):
         df_loc.rename(columns={loc_col[0]: 'Location'}, inplace=True)
         
     df_loc['Location'] = df_loc['Location'].astype(str).str.strip()
-    df_loc = df_loc.head(limit).copy()
     
-    # Extract city and country for geocoding (more reliable than full street addresses)
-    df_loc['city_key'] = df_loc['City'].fillna('').astype(str).str.strip()
-    df_loc['country_key'] = df_loc['iso Country'].fillna('').astype(str).str.strip()
+    # Safely find latitude and longitude columns from your file
+    lat_col = [c for c in df_loc.columns if 'lat' in str(c).lower()]
+    lon_col = [c for c in df_loc.columns if 'lon' in str(c).lower()]
+    
+    if lat_col and lon_col:
+        df_loc.rename(columns={lat_col[0]: 'lat', lon_col[0]: 'lon'}, inplace=True)
+    else:
+        # Fallback empty columns just in case
+        df_loc['lat'] = None
+        df_loc['lon'] = None
 
-    # Geocode only unique city/country combinations to reduce API calls
-    unique_pairs = df_loc[['city_key', 'country_key']].drop_duplicates()
-    total = len(unique_pairs)
+    # Ensure coordinates are numeric (handles empty strings or commas accidentally left in Excel)
+    df_loc['lat'] = pd.to_numeric(df_loc['lat'], errors='coerce')
+    df_loc['lon'] = pd.to_numeric(df_loc['lon'], errors='coerce')
 
-    # Nominatim requires a valid user agent to not block requests
-    headers = {'User-Agent': 'EMEA_Distribution_App_V4'}
-    coord_cache = {}
-
-    for i, (_, pair) in enumerate(unique_pairs.iterrows()):
-        city, country = pair['city_key'], pair['country_key']
-        query = f"{city}, {country}".strip(', ')
-        print(f"Geocoding ({i + 1}/{total}): {query}...")
-        try:
-            r = requests.get(
-                f"https://nominatim.openstreetmap.org/search?q={query}&format=json&limit=1",
-                headers=headers,
-                timeout=10,
-            ).json()
-            if r:
-                coord_cache[(city, country)] = (float(r[0]['lat']), float(r[0]['lon']))
-                print(f"  ✓ {query}")
-            else:
-                print(f"  ✗ No results for: {query}")
-                coord_cache[(city, country)] = (None, None)
-        except Exception as e:
-            print(f"  ✗ Error for {query}: {e}")
-            coord_cache[(city, country)] = (None, None)
-
-        time.sleep(1.1)
-
-    pair_keys = list(zip(df_loc['city_key'], df_loc['country_key']))
-    df_loc['lat'] = [coord_cache.get(k, (None, None))[0] for k in pair_keys]
-    df_loc['lon'] = [coord_cache.get(k, (None, None))[1] for k in pair_keys]
-    df_loc.drop(columns=['city_key', 'country_key'], inplace=True)
     return df_loc
 
 
@@ -196,8 +164,7 @@ try:
         df_data = load_and_process_data(st.session_state['data_file'])
     
         if enable_map:
-            with st.spinner(f"Geocoding locations... this takes ~{est_time}s"):
-                df_locations = load_locations_and_geocode(st.session_state['data_file'], max_locations)
+            df_locations = load_locations(st.session_state['data_file'])
 
     color_map = {'FWs': '#D8BFD8', 'RDCs': '#FFCCCB', 'LDCs': '#FFFFE0'}
 
@@ -208,7 +175,7 @@ try:
         fig1 = px.bar(df_market_role, x='Market', y='Volume', color='Wh_Role', 
                       color_discrete_map=color_map, barmode='stack')
         
-        # FIX: Sort from biggest to smallest
+        # Sort from biggest to smallest
         fig1.update_layout(xaxis={'categoryorder':'total descending'})
         st.plotly_chart(fig1, use_container_width=True)
     else:
@@ -224,7 +191,7 @@ try:
     fig2 = px.bar(df_market, x='Location', y='Volume', color='Wh_Role',
                   color_discrete_map=color_map, title=f"Location Detail: {selected_market}")
     
-    # FIX: Sort from biggest to smallest
+    # Sort from biggest to smallest
     fig2.update_layout(xaxis={'categoryorder':'total descending'})
     st.plotly_chart(fig2, use_container_width=True)
 
@@ -248,7 +215,7 @@ try:
             
             st.success(f"Successfully mapped {len(df_map['Location'].unique())} locations!")
         else:
-            st.warning("Locations could not be plotted. Geocoding API may have reached its limit, or there was a connection error.")
+            st.warning("Locations could not be plotted. Verify that the 'latitude' and 'longitude' columns exist in Sheet1.")
     else:
         st.info("Map is disabled via the sidebar. Enable it to view the geographic distribution.")
 
