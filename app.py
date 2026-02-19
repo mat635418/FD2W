@@ -54,6 +54,9 @@ def load_and_process_data(file_source):
     # Using .stack() is the safest way to flatten a MultiIndex column in modern pandas
     df_long = df_pivot.stack(level=['ForecastType', 'Location']).reset_index(name='Volume')
     
+    # Convert Volume to numeric, coercing errors to NaN
+    df_long['Volume'] = pd.to_numeric(df_long['Volume'], errors='coerce')
+    
     # Clean data: drop NAs and zero volume
     df_long = df_long.dropna(subset=['Volume'])
     df_long = df_long[df_long['Volume'] > 0]
