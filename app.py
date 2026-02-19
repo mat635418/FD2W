@@ -51,26 +51,23 @@ enable_map = st.sidebar.checkbox("Enable Geographical Map", value=True, help="Di
 
 max_locations = 40
 if enable_map:
-    max_locations = st.sidebar.slider("Locations to Geocode", min_value=5, max_value=100, value=30, step=5)
+    max_locations = st.sidebar.slider("Locations to Geocode", min_value=5, max_value=100, value=40, step=5)
     est_time = int(max_locations * 1.2)
-    st.sidebar.info(f"⏱️ Estimated loading time: ~{est_time} seconds")
+    st.sidebar.info(f"⏱️ Estimated map loading time: ~{est_time} seconds")
 
 
-# --- 2. DATA PROCESSING (SIMPLIFIED & CRASH-PROOF) ---
+# --- 2. DATA PROCESSING ---
 @st.cache_data(show_spinner=False)
 def load_and_process_data(file_source):
-    # Read the 'full' sheet without headers (skiprows=0 now because metadata is gone)
+    # Read the 'full' sheet
     df_raw = pd.read_excel(file_source, sheet_name='full', header=None)
     
-    # Extract the two header rows
-    forecast_types = df_raw.iloc[0].ffill() # Forward fill merged cells
+    forecast_types = df_raw.iloc[0].ffill() 
     locations = df_raw.iloc[1]
     
-    # Extract the actual data (Row 2 onwards)
     df_data = df_raw.iloc[2:].copy()
     
-    # Build a single flat list of unique column names using a regex-safe separator
-    new_columns = ['Market'] # The first column is always the Market
+    new_columns = ['Market']
     for i in range(1, len(df_raw.columns)):
         ft = str(forecast_types.iloc[i]).strip()
         loc = str(locations.iloc[i]).strip()
@@ -78,23 +75,21 @@ def load_and_process_data(file_source):
         
     df_data.columns = new_columns
     
-    # Melt it down into a long format
     df_long = df_data.melt(id_vars=['Market'], var_name='RawCol', value_name='Volume')
     
-    # Unbreakable extraction
     df_long['ForecastType'] = df_long['RawCol'].apply(lambda x: str(x).split('___')[0] if '___' in str(x) else 'Unknown')
     df_long['Location'] = df_long['RawCol'].apply(lambda x: str(x).split('___')[1] if '___' in str(x) else str(x))
     df_long.drop(columns=['RawCol'], inplace=True)
     
-    # Clean up the data
     df_long = df_long.dropna(subset=['Market'])
     df_long['Market'] = df_long['Market'].astype(str).str.strip()
     
-    # Force Volume to numeric
-    df_long['Volume'] = pd.to_numeric(df_long['Volume'], errors='coerce').fillna(0)
-    df_long = df_long[df_long['Volume'] > 0] # Drop empty lines
+    # REMOVE GRAND TOTALS
+    df_long = df_long[~df_long['Market'].str.contains('Total', case=False, na=False)]
     
-    # Role Mapping
+    df_long['Volume'] = pd.to_numeric(df_long['Volume'], errors='coerce').fillna(0)
+    df_long = df_long[df_long['Volume'] > 0] 
+    
     def map_role(val):
         val = str(val).lower()
         if 'ldc' in val: return 'LDCs'
@@ -105,25 +100,24 @@ def load_and_process_data(file_source):
     df_long['Wh_Role'] = df_long['ForecastType'].apply(map_role)
     df_long = df_long[df_long['Wh_Role'] != 'Other']
     
-    # Aggregate to sum up LDC and LDC split
     df_agg = df_long.groupby(['Market', 'Wh_Role', 'Location'])['Volume'].sum().reset_index()
     return df_agg
 
+
 @st.cache_data(show_spinner=False)
 def load_locations_and_geocode(file_source, limit):
-    # Read the 'Sheet1' for locations
     df_loc = pd.read_excel(file_source, sheet_name='Sheet1')
     
-    # Clean location column name
-    if 'location' in df_loc.columns:
-        df_loc.rename(columns={'location': 'Location'}, inplace=True)
-    else:
-        df_loc.rename(columns={df_loc.columns[0]: 'Location'}, inplace=True)
+    # THE FIX: Safely find the actual "location" column regardless of leading empty columns
+    loc_col = [c for c in df_loc.columns if 'location' in str(c).lower()]
+    if loc_col:
+        df_loc.rename(columns={loc_col[0]: 'Location'}, inplace=True)
         
     df_loc['Location'] = df_loc['Location'].astype(str).str.strip()
     df_loc = df_loc.head(limit).copy()
     
-    headers = {'User-Agent': 'GoodYearDistributionApp/3.0'}
+    # Nominatim requires a valid user agent to not block requests
+    headers = {'User-Agent': 'EMEA_Distribution_App_V4'}
     latitudes, longitudes = [], []
     
     for _, row in df_loc.iterrows():
@@ -194,21 +188,26 @@ try:
         df_data = load_and_process_data(st.session_state['data_file'])
     
         if enable_map:
-            with st.spinner(f"Geocoding up to {max_locations} locations... this will take ~{est_time}s"):
+            with st.spinner(f"Geocoding locations... this takes ~{est_time}s"):
                 df_locations = load_locations_and_geocode(st.session_state['data_file'], max_locations)
 
     color_map = {'FWs': '#D8BFD8', 'RDCs': '#FFCCCB', 'LDCs': '#FFFFE0'}
 
+    # Chart 1: Market & Role
     st.header("1. EMEA Network View (Market & Wh Role)")
     if not df_data.empty:
         df_market_role = df_data.groupby(['Market', 'Wh_Role'])['Volume'].sum().reset_index()
         fig1 = px.bar(df_market_role, x='Market', y='Volume', color='Wh_Role', 
                       color_discrete_map=color_map, barmode='stack')
+        
+        # FIX: Sort from biggest to smallest
+        fig1.update_layout(xaxis={'categoryorder':'total descending'})
         st.plotly_chart(fig1, use_container_width=True)
     else:
-        st.error("Data was processed, but the final table is empty. Please verify the structure of the 'full' sheet.")
+        st.error("Data was processed, but the final table is empty.")
         st.stop()
 
+    # Chart 2: Specific Market Drill-down
     st.divider()
     st.header("2. Specific Market Drill-down")
     markets = [m for m in sorted(df_data['Market'].unique()) if str(m).lower() != 'nan' and str(m).strip() != '']
@@ -216,23 +215,32 @@ try:
     df_market = df_data[df_data['Market'] == selected_market]
     fig2 = px.bar(df_market, x='Location', y='Volume', color='Wh_Role',
                   color_discrete_map=color_map, title=f"Location Detail: {selected_market}")
+    
+    # FIX: Sort from biggest to smallest
+    fig2.update_layout(xaxis={'categoryorder':'total descending'})
     st.plotly_chart(fig2, use_container_width=True)
 
+    # Chart 3: Map
     st.divider()
     st.header("3. Geographical Network Map")
     if enable_map:
         df_data['Location'] = df_data['Location'].astype(str).str.strip()
         df_map_agg = df_data.groupby(['Location', 'Wh_Role'])['Volume'].sum().reset_index()
+        
+        # Merge data to locations
         df_map = pd.merge(df_locations, df_map_agg, on='Location', how='inner').dropna(subset=['lat', 'lon'])
 
         if not df_map.empty:
             fig_map = px.scatter_mapbox(df_map, lat='lat', lon='lon', color='Wh_Role', size='Volume',
                                         hover_name='Location', hover_data=['City', 'Volume'],
                                         color_discrete_map=color_map, zoom=3, height=700,
-                                        mapbox_style='carto-positron')
+                                        mapbox_style='carto-positron',
+                                        size_max=45) # Increased bubble size for visibility
             st.plotly_chart(fig_map, use_container_width=True)
+            
+            st.success(f"Successfully mapped {len(df_map['Location'].unique())} locations!")
         else:
-            st.warning("Locations could not be plotted. Either the geocoding API reached its limit, or the location names in the sheets don't match.")
+            st.warning("Locations could not be plotted. Geocoding API may have reached its limit, or there was a connection error.")
     else:
         st.info("Map is disabled via the sidebar. Enable it to view the geographic distribution.")
 
